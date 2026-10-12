@@ -2,7 +2,8 @@ name: Sync Upstream
 
 on:
   schedule:
-    - cron: '0 */6 * * *'
+    # Daily at 21:17 UTC (~05:17 Beijing time); odd minute avoids runner congestion
+    - cron: '17 21 * * *'
   workflow_dispatch:
 
 permissions:
