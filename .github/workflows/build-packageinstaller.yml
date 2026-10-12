@@ -1,8 +1,18 @@
 
-name: Build PackageInstaller APK
+name: Build InstallerX ColorOS KSU Module
 
 'on':
   workflow_dispatch:
+    inputs:
+      target_path:
+        description: "Must match the existing system installer directory"
+        required: true
+        type: choice
+        options:
+          - product/priv-app/PackageInstaller
+          - priv-app/PackageInstaller
+          - system_ext/priv-app/PackageInstaller
+        default: product/priv-app/PackageInstaller
 
 permissions:
   contents: read
@@ -24,37 +34,223 @@ jobs:
           distribution: zulu
           java-version: '25'
 
+      - name: Configure Gradle credentials
+        env:
+          GPR_USER: ${{ github.actor }}
+          GPR_KEY: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p "$HOME/.gradle"
+          printf 'gpr.user=%s\ngpr.key=%s\n' \
+            "$GPR_USER" "$GPR_KEY" \
+            > "$HOME/.gradle/gradle.properties"
+
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
       - name: Build APK
-        env:
-          GITHUB_ACTOR: ${{ github.actor }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           chmod +x ./gradlew
           ./gradlew assembleStableRelease \
             -PAPP_ID=com.android.packageinstaller
 
-      - name: Locate APK
+      - name: Find and verify APK
         id: apk
         shell: bash
         run: |
           set -euo pipefail
 
-          find app/build/outputs/apk -type f -name '*.apk'
+          mkdir -p "$RUNNER_TEMP/build"
+          FOUND=0
 
-          APK="$(find app/build/outputs/apk \
-            -type f -name '*.apk' \
-            ! -name '*androidTest*' | head -n 1)"
+          while IFS= read -r APK; do
+            [ -n "$APK" ] || continue
 
-          test -n "$APK"
-          echo "apk=$APK" >> "$GITHUB_OUTPUT"
+            if [[ "$APK" == *androidTest* ]] ||
+               [[ "$APK" == *test* ]]; then
+              continue
+            fi
 
-      - name: Upload APK
+            if unzip -p "$APK" \
+              AndroidManifest.xml >/dev/null 2>&1; then
+              echo "Checking $APK"
+            fi
+
+            AAPT="$(find "$ANDROID_HOME/build-tools" \
+              -type f -name aapt | sort -V | tail -n 1)"
+
+            if [ -z "$AAPT" ]; then
+              echo "Android aapt not found"
+              exit 1
+            fi
+
+            PACKAGE="$("$AAPT" dump badging "$APK" 2>/dev/null |
+              sed -n "s/^package: name='\([^']*\)'.*/\1/p" |
+              head -n 1 || true)"
+
+            if [ "$PACKAGE" = "com.android.packageinstaller" ]; then
+              cp "$APK" "$RUNNER_TEMP/build/InstallerX.apk"
+              FOUND=1
+              break
+            fi
+          done < <(find app/build/outputs/apk \
+            -type f -name '*.apk' | sort)
+
+          if [ "$FOUND" -ne 1 ]; then
+            echo "No APK with the required application ID found."
+            find app/build/outputs/apk -type f || true
+            exit 1
+          fi
+
+          echo "apk=$RUNNER_TEMP/build/InstallerX.apk" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Create KernelSU module
+        env:
+          TARGET_PATH: ${{ inputs.target_path }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+
+          MOD="$RUNNER_TEMP/module"
+          rm -rf "$MOD"
+          mkdir -p "$MOD/payload"
+
+          cp "${{ steps.apk.outputs.apk }}" \
+            "$MOD/payload/InstallerX.apk"
+
+          cat > "$MOD/module.prop" <<EOF
+          id=installerx_coloros
+          name=InstallerX ColorOS PackageInstaller
+          version=CI-${RUN_NUMBER}
+          versionCode=${RUN_NUMBER}
+          author=Local Fork
+          description=OnePlus-only InstallerX system installer replacement
+          EOF
+
+          cat > "$MOD/customize.sh" <<'EOF'
+          ui_print "- InstallerX ColorOS module"
+          ui_print "- Checking device compatibility"
+
+          is_oneplus() {
+            for PROP in \
+              ro.product.brand \
+              ro.product.manufacturer \
+              ro.product.vendor.brand \
+              ro.product.vendor.manufacturer \
+              ro.product.odm.brand \
+              ro.product.odm.manufacturer
+            do
+              VALUE="$(getprop "$PROP" 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+              if [ "$VALUE" = "oneplus" ]; then
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          if ! is_oneplus; then
+            abort "! Unsupported device: OnePlus devices only"
+          fi
+
+          ui_print "- OnePlus manufacturer check passed"
+
+          if [ -z "$(pm path com.android.packageinstaller 2>/dev/null)" ]; then
+            abort "! com.android.packageinstaller is not installed"
+          fi
+
+          if [ -n "$(pm path com.google.android.packageinstaller 2>/dev/null)" ]; then
+            abort "! Google PackageInstaller detected; refusing replacement"
+          fi
+
+          APK_PATH="$(pm path com.android.packageinstaller 2>/dev/null |
+            head -n 1 | sed 's/^package://')"
+
+          case "$APK_PATH" in
+            /system/*)
+              ACTUAL_PATH="${APK_PATH#/system/}"
+              ;;
+            /system_ext/*)
+              ACTUAL_PATH="system_ext/${APK_PATH#/system_ext/}"
+              ;;
+            /product/*)
+              ACTUAL_PATH="product/${APK_PATH#/product/}"
+              ;;
+            *)
+              abort "! Unknown installer partition: $APK_PATH"
+              ;;
+          esac
+
+          ACTUAL_DIR="${ACTUAL_PATH%/*}"
+          EXPECTED_DIR="__TARGET_PATH__"
+
+          if [ "$ACTUAL_DIR" != "$EXPECTED_DIR" ]; then
+            abort "! Installer path mismatch"
+            abort "! Actual: $ACTUAL_DIR"
+            abort "! Expected: $EXPECTED_DIR"
+          fi
+
+          ui_print "- Installer path check passed"
+          ui_print "- Installing APK into matched path"
+
+          mkdir -p "$MODPATH/system/$EXPECTED_DIR" ||
+            abort "! Cannot create target directory"
+
+          cp "$MODPATH/payload/InstallerX.apk" \
+            "$MODPATH/system/$EXPECTED_DIR/PackageInstaller.apk" ||
+            abort "! Failed to copy APK"
+
+          chmod 0644 \
+            "$MODPATH/system/$EXPECTED_DIR/PackageInstaller.apk" ||
+            abort "! Failed to set APK permissions"
+
+          rm -rf "$MODPATH/payload"
+
+          ui_print "- Installation checks passed"
+          ui_print "- Reboot to activate the module"
+          EOF
+
+          sed -i \
+            "s|__TARGET_PATH__|$TARGET_PATH|g" \
+            "$MOD/customize.sh"
+
+          cat > "$MOD/README.txt" <<EOF
+          KernelSU module for OnePlus ColorOS.
+
+          Application ID: com.android.packageinstaller
+          Expected installer directory: $TARGET_PATH
+
+          Installation is rejected unless:
+          - A OnePlus brand/manufacturer property is present.
+          - com.android.packageinstaller exists.
+          - The Google installer package is absent.
+          - The existing installer directory matches the selected path.
+
+          This module does not generate privileged permission XML.
+          Verify ROM permissions and APK signing before enabling.
+          EOF
+
+          cd "$MOD"
+          zip -qr "$RUNNER_TEMP/InstallerX-ColorOS-KSU.zip" .
+
+      - name: Validate ZIP
+        run: |
+          set -euo pipefail
+
+          ZIP="$RUNNER_TEMP/InstallerX-ColorOS-KSU.zip"
+          unzip -t "$ZIP"
+
+          unzip -p "$ZIP" module.prop |
+            grep -q '^id=installerx_coloros$'
+
+          unzip -p "$ZIP" customize.sh |
+            grep -q 'Unsupported device: OnePlus devices only'
+
+          unzip -l "$ZIP" | grep -q 'payload/InstallerX.apk'
+
+      - name: Upload KernelSU module
         uses: actions/upload-artifact@v4
         with:
-          name: PackageInstaller-APK
-          path: ${{ steps.apk.outputs.apk }}
+          name: InstallerX-ColorOS-KSU
+          path: ${{ runner.temp }}/InstallerX-ColorOS-KSU.zip
           if-no-files-found: error
           retention-days: 7
