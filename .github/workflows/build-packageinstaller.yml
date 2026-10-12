@@ -1,18 +1,8 @@
 
-name: Build InstallerX ColorOS KSU Module
+name: Build InstallerX OnePlus OPPO KSU Module
 
 'on':
   workflow_dispatch:
-    inputs:
-      target_path:
-        description: "Must match the existing system installer directory"
-        required: true
-        type: choice
-        options:
-          - product/priv-app/PackageInstaller
-          - priv-app/PackageInstaller
-          - system_ext/priv-app/PackageInstaller
-        default: product/priv-app/PackageInstaller
 
 permissions:
   contents: read
@@ -34,223 +24,251 @@ jobs:
           distribution: zulu
           java-version: '25'
 
-      - name: Configure Gradle credentials
-        env:
-          GPR_USER: ${{ github.actor }}
-          GPR_KEY: ${{ secrets.GITHUB_TOKEN }}
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android build tools
         run: |
-          mkdir -p "$HOME/.gradle"
-          printf 'gpr.user=%s\ngpr.key=%s\n' \
-            "$GPR_USER" "$GPR_KEY" \
-            > "$HOME/.gradle/gradle.properties"
+          sdkmanager "build-tools;36.0.0"
+          echo "$ANDROID_HOME/build-tools/36.0.0" >> "$GITHUB_PATH"
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Build APK
+      - name: Configure GitHub Packages credentials
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p "$HOME/.gradle"
+          {
+            printf 'gpr.user=%s\n' "$GITHUB_ACTOR"
+            printf 'gpr.key=%s\n' "$GITHUB_TOKEN"
+          } >> "$HOME/.gradle/gradle.properties"
+
+      - name: Build InstallerX
         run: |
           chmod +x ./gradlew
           ./gradlew assembleStableRelease \
             -PAPP_ID=com.android.packageinstaller
 
-      - name: Find and verify APK
+      - name: Verify APK package name
         id: apk
         shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p "$RUNNER_TEMP/build"
-          FOUND=0
+          APK=""
+          APK_DIR="app/build/outputs/apk"
 
-          while IFS= read -r APK; do
-            [ -n "$APK" ] || continue
+          while IFS= read -r candidate; do
+            [ -n "$candidate" ] || continue
 
-            if [[ "$APK" == *androidTest* ]] ||
-               [[ "$APK" == *test* ]]; then
-              continue
-            fi
-
-            if unzip -p "$APK" \
-              AndroidManifest.xml >/dev/null 2>&1; then
-              echo "Checking $APK"
-            fi
-
-            AAPT="$(find "$ANDROID_HOME/build-tools" \
-              -type f -name aapt | sort -V | tail -n 1)"
-
-            if [ -z "$AAPT" ]; then
-              echo "Android aapt not found"
-              exit 1
-            fi
-
-            PACKAGE="$("$AAPT" dump badging "$APK" 2>/dev/null |
+            PACKAGE="$(aapt dump badging "$candidate" 2>/dev/null |
               sed -n "s/^package: name='\([^']*\)'.*/\1/p" |
               head -n 1 || true)"
 
+            echo "Checking: $candidate"
+            echo "Application ID: $PACKAGE"
+
             if [ "$PACKAGE" = "com.android.packageinstaller" ]; then
-              cp "$APK" "$RUNNER_TEMP/build/InstallerX.apk"
-              FOUND=1
+              APK="$candidate"
               break
             fi
-          done < <(find app/build/outputs/apk \
-            -type f -name '*.apk' | sort)
+          done < <(find "$APK_DIR" -type f -name '*.apk' |
+            grep -v -E 'androidTest|test' | sort)
 
-          if [ "$FOUND" -ne 1 ]; then
-            echo "No APK with the required application ID found."
-            find app/build/outputs/apk -type f || true
+          if [ -z "$APK" ]; then
+            echo "::error::APK package must be com.android.packageinstaller"
+            find "$APK_DIR" -type f -name '*.apk' || true
             exit 1
           fi
 
-          echo "apk=$RUNNER_TEMP/build/InstallerX.apk" \
+          mkdir -p "$RUNNER_TEMP/module/payload"
+          cp "$APK" "$RUNNER_TEMP/module/payload/InstallerX.apk"
+
+          cd "$RUNNER_TEMP/module/payload"
+          sha256sum InstallerX.apk > SHA256SUMS
+
+          echo "apk=$RUNNER_TEMP/module/payload/InstallerX.apk" \
             >> "$GITHUB_OUTPUT"
 
-      - name: Create KernelSU module
+      - name: Create KernelSU module metadata
         env:
-          TARGET_PATH: ${{ inputs.target_path }}
           RUN_NUMBER: ${{ github.run_number }}
         run: |
           set -euo pipefail
 
           MOD="$RUNNER_TEMP/module"
-          rm -rf "$MOD"
-          mkdir -p "$MOD/payload"
-
-          cp "${{ steps.apk.outputs.apk }}" \
-            "$MOD/payload/InstallerX.apk"
 
           cat > "$MOD/module.prop" <<EOF
-          id=installerx_coloros
-          name=InstallerX ColorOS PackageInstaller
+          id=installerx_oneplus_oppo
+          name=InstallerX OnePlus OPPO
           version=CI-${RUN_NUMBER}
           versionCode=${RUN_NUMBER}
-          author=Local Fork
-          description=OnePlus-only InstallerX system installer replacement
+          author=InstallerX Fork
+          description=PackageInstaller replacement for compatible OnePlus and OPPO devices
           EOF
 
+          cat > "$MOD/README.txt" <<'EOF'
+          InstallerX OnePlus / OPPO KernelSU module
+
+          Required APK package:
+          com.android.packageinstaller
+
+          The installer checks the device brand/manufacturer and the
+          existing system privileged-installer APK path.
+
+          The APK is installed at the same partition-relative path
+          and filename as the existing installer.
+
+          Verify ROM signature compatibility and privileged permissions
+          before enabling the module.
+          EOF
+
+      - name: Create installation script
+        run: |
+          set -euo pipefail
+
+          MOD="$RUNNER_TEMP/module"
+
           cat > "$MOD/customize.sh" <<'EOF'
-          ui_print "- InstallerX ColorOS module"
-          ui_print "- Checking device compatibility"
+          ui_print "- InstallerX OnePlus / OPPO"
+          ui_print "- Checking device"
 
-          is_oneplus() {
-            for PROP in \
-              ro.product.brand \
-              ro.product.manufacturer \
-              ro.product.vendor.brand \
-              ro.product.vendor.manufacturer \
-              ro.product.odm.brand \
-              ro.product.odm.manufacturer
-            do
-              VALUE="$(getprop "$PROP" 2>/dev/null | tr '[:upper:]' '[:lower:]')"
-              if [ "$VALUE" = "oneplus" ]; then
-                return 0
-              fi
-            done
-            return 1
-          }
+          BRAND="$(getprop ro.product.brand | tr '[:upper:]' '[:lower:]')"
+          MANUFACTURER="$(getprop ro.product.manufacturer | tr '[:upper:]' '[:lower:]')"
 
-          if ! is_oneplus; then
-            abort "! Unsupported device: OnePlus devices only"
-          fi
+          case "$BRAND $MANUFACTURER" in
+            *oneplus*|*oppo*)
+              ui_print "- Supported brand detected"
+              ;;
+            *)
+              abort "! Only OnePlus and OPPO devices are supported"
+              ;;
+          esac
 
-          ui_print "- OnePlus manufacturer check passed"
+          DEVICE="$(getprop ro.product.device)"
+          ui_print "- Device: $DEVICE"
 
-          if [ -z "$(pm path com.android.packageinstaller 2>/dev/null)" ]; then
+          ORIGINAL="$(pm path com.android.packageinstaller 2>/dev/null |
+            head -n 1 | sed 's/^package://')"
+
+          if [ -z "$ORIGINAL" ]; then
             abort "! com.android.packageinstaller is not installed"
           fi
+
+          case "$ORIGINAL" in
+            /system/priv-app/*/*.apk|\
+            /system_ext/priv-app/*/*.apk|\
+            /product/priv-app/*/*.apk)
+              ;;
+            *)
+              abort "! Unsupported installer path: $ORIGINAL"
+              ;;
+          esac
 
           if [ -n "$(pm path com.google.android.packageinstaller 2>/dev/null)" ]; then
             abort "! Google PackageInstaller detected; refusing replacement"
           fi
 
-          APK_PATH="$(pm path com.android.packageinstaller 2>/dev/null |
-            head -n 1 | sed 's/^package://')"
+          SOURCE="$MODPATH/payload/InstallerX.apk"
+          CHECKSUMS="$MODPATH/payload/SHA256SUMS"
 
-          case "$APK_PATH" in
+          [ -f "$SOURCE" ] ||
+            abort "! InstallerX APK is missing"
+
+          [ -f "$CHECKSUMS" ] ||
+            abort "! APK checksum file is missing"
+
+          if ! (cd "$MODPATH/payload" && sha256sum -c SHA256SUMS); then
+            abort "! APK checksum verification failed"
+          fi
+
+          RELATIVE=""
+
+          case "$ORIGINAL" in
             /system/*)
-              ACTUAL_PATH="${APK_PATH#/system/}"
+              RELATIVE="${ORIGINAL#/system/}"
               ;;
             /system_ext/*)
-              ACTUAL_PATH="system_ext/${APK_PATH#/system_ext/}"
+              RELATIVE="system_ext/${ORIGINAL#/system_ext/}"
               ;;
             /product/*)
-              ACTUAL_PATH="product/${APK_PATH#/product/}"
-              ;;
-            *)
-              abort "! Unknown installer partition: $APK_PATH"
+              RELATIVE="product/${ORIGINAL#/product/}"
               ;;
           esac
 
-          ACTUAL_DIR="${ACTUAL_PATH%/*}"
-          EXPECTED_DIR="__TARGET_PATH__"
+          TARGET="$MODPATH/system/$RELATIVE"
+          TARGET_DIR="${TARGET%/*}"
 
-          if [ "$ACTUAL_DIR" != "$EXPECTED_DIR" ]; then
-            abort "! Installer path mismatch"
-            abort "! Actual: $ACTUAL_DIR"
-            abort "! Expected: $EXPECTED_DIR"
-          fi
+          mkdir -p "$TARGET_DIR" ||
+            abort "! Cannot create module target directory"
 
-          ui_print "- Installer path check passed"
-          ui_print "- Installing APK into matched path"
+          cp "$SOURCE" "$TARGET" ||
+            abort "! Failed to copy InstallerX APK"
 
-          mkdir -p "$MODPATH/system/$EXPECTED_DIR" ||
-            abort "! Cannot create target directory"
-
-          cp "$MODPATH/payload/InstallerX.apk" \
-            "$MODPATH/system/$EXPECTED_DIR/PackageInstaller.apk" ||
-            abort "! Failed to copy APK"
-
-          chmod 0644 \
-            "$MODPATH/system/$EXPECTED_DIR/PackageInstaller.apk" ||
+          chmod 0644 "$TARGET" ||
             abort "! Failed to set APK permissions"
 
           rm -rf "$MODPATH/payload"
 
-          ui_print "- Installation checks passed"
-          ui_print "- Reboot to activate the module"
+          ui_print "- Manufacturer check passed"
+          ui_print "- Original path: $ORIGINAL"
+          ui_print "- Target path: $TARGET"
+          ui_print "- APK checksum verified"
+          ui_print "- Build-time package validation passed"
+          ui_print "- Module files prepared"
           EOF
 
-          sed -i \
-            "s|__TARGET_PATH__|$TARGET_PATH|g" \
-            "$MOD/customize.sh"
-
-          cat > "$MOD/README.txt" <<EOF
-          KernelSU module for OnePlus ColorOS.
-
-          Application ID: com.android.packageinstaller
-          Expected installer directory: $TARGET_PATH
-
-          Installation is rejected unless:
-          - A OnePlus brand/manufacturer property is present.
-          - com.android.packageinstaller exists.
-          - The Google installer package is absent.
-          - The existing installer directory matches the selected path.
-
-          This module does not generate privileged permission XML.
-          Verify ROM permissions and APK signing before enabling.
-          EOF
-
-          cd "$MOD"
-          zip -qr "$RUNNER_TEMP/InstallerX-ColorOS-KSU.zip" .
-
-      - name: Validate ZIP
+      - name: Assemble module ZIP
         run: |
           set -euo pipefail
 
-          ZIP="$RUNNER_TEMP/InstallerX-ColorOS-KSU.zip"
+          MOD="$RUNNER_TEMP/module"
+
+          cd "$MOD"
+          zip -qr "$RUNNER_TEMP/InstallerX-OnePlus-OPPO-KSU.zip" .
+
+      - name: Validate module ZIP and APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP="$RUNNER_TEMP/InstallerX-OnePlus-OPPO-KSU.zip"
+          VERIFY="$RUNNER_TEMP/verify"
+
           unzip -t "$ZIP"
+          mkdir -p "$VERIFY"
+          unzip -q "$ZIP" -d "$VERIFY"
 
-          unzip -p "$ZIP" module.prop |
-            grep -q '^id=installerx_coloros$'
+          grep -q '^id=installerx_oneplus_oppo$' \
+            "$VERIFY/module.prop"
 
-          unzip -p "$ZIP" customize.sh |
-            grep -q 'Unsupported device: OnePlus devices only'
+          test -f "$VERIFY/payload/InstallerX.apk"
+          test -f "$VERIFY/payload/SHA256SUMS"
 
-          unzip -l "$ZIP" | grep -q 'payload/InstallerX.apk'
+          (
+            cd "$VERIFY/payload"
+            sha256sum -c SHA256SUMS
+          )
+
+          PACKAGE="$(aapt dump badging "$VERIFY/payload/InstallerX.apk" |
+            sed -n "s/^package: name='\([^']*\)'.*/\1/p" |
+            head -n 1)"
+
+          if [ "$PACKAGE" != "com.android.packageinstaller" ]; then
+            echo "::error::Unexpected package: $PACKAGE"
+            exit 1
+          fi
+
+          echo "Verified package: $PACKAGE"
+          echo "Module ZIP validation passed"
 
       - name: Upload KernelSU module
         uses: actions/upload-artifact@v4
         with:
-          name: InstallerX-ColorOS-KSU
-          path: ${{ runner.temp }}/InstallerX-ColorOS-KSU.zip
+          name: InstallerX-OnePlus-OPPO-KSU
+          path: ${{ runner.temp }}/InstallerX-OnePlus-OPPO-KSU.zip
           if-no-files-found: error
           retention-days: 7
