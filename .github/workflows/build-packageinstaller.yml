@@ -28,7 +28,7 @@ jobs:
 
       - name: Install Android build tools
         run: |
-          sdkmanager "build-tools;36.0.0"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "build-tools;36.0.0"
           echo "$ANDROID_HOME/build-tools/36.0.0" >> "$GITHUB_PATH"
 
       - name: Setup Gradle
