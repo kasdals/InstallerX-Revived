@@ -5,7 +5,7 @@ name: Build InstallerX OnePlus OPPO KSU Module
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   packages: read
 
 jobs:
@@ -48,6 +48,7 @@ jobs:
 
       - name: Build InstallerX
         run: |
+          set -euo pipefail
           chmod +x ./gradlew
           ./gradlew assembleStableRelease \
             -PAPP_ID=com.android.packageinstaller
@@ -75,8 +76,11 @@ jobs:
               APK="$candidate"
               break
             fi
-          done < <(find "$APK_DIR" -type f -name '*.apk' |
-            grep -v -E 'androidTest|test' | sort)
+          done < <(
+            find "$APK_DIR" -type f -name '*.apk' |
+            grep -v -E 'androidTest|test' |
+            sort
+          )
 
           if [ -z "$APK" ]; then
             echo "::error::APK package must be com.android.packageinstaller"
@@ -89,9 +93,6 @@ jobs:
 
           cd "$RUNNER_TEMP/module/payload"
           sha256sum InstallerX.apk > SHA256SUMS
-
-          echo "apk=$RUNNER_TEMP/module/payload/InstallerX.apk" \
-            >> "$GITHUB_OUTPUT"
 
       - name: Create KernelSU module metadata
         env:
@@ -117,10 +118,10 @@ jobs:
           com.android.packageinstaller
 
           The installer checks the device brand/manufacturer and the
-          existing system privileged-installer APK path.
+          existing privileged-installer APK path.
 
-          The APK is installed at the same partition-relative path
-          and filename as the existing installer.
+          The APK is placed at the same partition-relative path and
+          filename as the existing installer.
 
           Verify ROM signature compatibility and privileged permissions
           before enabling the module.
@@ -185,8 +186,6 @@ jobs:
             abort "! APK checksum verification failed"
           fi
 
-          RELATIVE=""
-
           case "$ORIGINAL" in
             /system/*)
               RELATIVE="${ORIGINAL#/system/}"
@@ -213,11 +212,10 @@ jobs:
 
           rm -rf "$MODPATH/payload"
 
-          ui_print "- Manufacturer check passed"
+          ui_print "- Brand check passed"
           ui_print "- Original path: $ORIGINAL"
           ui_print "- Target path: $TARGET"
           ui_print "- APK checksum verified"
-          ui_print "- Build-time package validation passed"
           ui_print "- Module files prepared"
           EOF
 
@@ -265,10 +263,31 @@ jobs:
           echo "Verified package: $PACKAGE"
           echo "Module ZIP validation passed"
 
-      - name: Upload KernelSU module
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: InstallerX-OnePlus-OPPO-KSU
           path: ${{ runner.temp }}/InstallerX-OnePlus-OPPO-KSU.zip
           if-no-files-found: error
           retention-days: 7
+
+      - name: Publish GitHub Pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: InstallerX OnePlus OPPO - Build ${{ github.run_number }}
+          body: |
+            Automated InstallerX build for compatible OnePlus and OPPO devices.
+
+            - Target package: com.android.packageinstaller
+            - Module format: KernelSU
+            - Build number: ${{ github.run_number }}
+
+            Verify ROM signature and privileged permission compatibility
+            before installing.
+          files: ${{ runner.temp }}/InstallerX-OnePlus-OPPO-KSU.zip
+          draft: false
+          prerelease: true
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
