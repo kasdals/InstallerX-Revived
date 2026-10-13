@@ -126,6 +126,11 @@ jobs:
           The APK is placed at the same partition-relative path and
           filename as the existing installer.
 
+          If the active installer was data-installed (updated or
+          sideloaded), the module locates the system priv-app copy and
+          removes the data copy so the module version activates after
+          reboot.
+
           Verify ROM signature compatibility and privileged permissions
           before enabling the module.
           EOF
@@ -144,7 +149,7 @@ jobs:
           MANUFACTURER="$(getprop ro.product.manufacturer | tr '[:upper:]' '[:lower:]')"
 
           case "$BRAND $MANUFACTURER" in
-            *oneplus*|*oppo*)
+            *oneplus*|*oppo*|*oplus*)
               ui_print "- Supported brand detected"
               ;;
             *)
@@ -162,18 +167,40 @@ jobs:
             abort "! com.android.packageinstaller is not installed"
           fi
 
+          if [ -n "$(pm path com.google.android.packageinstaller 2>/dev/null)" ]; then
+            abort "! Google PackageInstaller detected; refusing replacement"
+          fi
+
+          # The ACTIVE copy may live in /data (updated or sideloaded); a data
+          # copy always overrides the system priv-app one, so find the real
+          # system path to replace and drop the data copy at the end.
+          ACTIVE_IS_DATA=false
           case "$ORIGINAL" in
             /system/priv-app/*/*.apk|\
             /system_ext/priv-app/*/*.apk|\
             /product/priv-app/*/*.apk)
+              ;;
+            /data/*)
+              ACTIVE_IS_DATA=true
               ;;
             *)
               abort "! Unsupported installer path: $ORIGINAL"
               ;;
           esac
 
-          if [ -n "$(pm path com.google.android.packageinstaller 2>/dev/null)" ]; then
-            abort "! Google PackageInstaller detected; refusing replacement"
+          if [ "$ACTIVE_IS_DATA" = "true" ]; then
+            ui_print "- Active copy is data-installed (updated or sideloaded)"
+            ui_print "- Locating the system priv-app copy"
+
+            SYSCOPY="$(find /product/priv-app /system_ext/priv-app /system/priv-app \
+              -maxdepth 3 -iname '*packageinstaller*.apk' 2>/dev/null | head -n 1)"
+
+            if [ -z "$SYSCOPY" ]; then
+              abort "! No system PackageInstaller found on system partitions"
+            fi
+
+            ui_print "- System copy: $SYSCOPY"
+            ORIGINAL="$SYSCOPY"
           fi
 
           SOURCE="$MODPATH/payload/InstallerX.apk"
@@ -214,6 +241,18 @@ jobs:
             abort "! Failed to set APK permissions"
 
           rm -rf "$MODPATH/payload"
+
+          if [ "$ACTIVE_IS_DATA" = "true" ]; then
+            ui_print "- Removing data copy (it overrides the system app)"
+            if pm uninstall --user 0 com.android.packageinstaller >/dev/null 2>&1; then
+              ui_print "- Data copy removed"
+              ui_print "- Reboot to activate InstallerX"
+            else
+              ui_print "! Could not remove data copy automatically"
+              ui_print "! After reboot run:"
+              ui_print "! su -c 'pm uninstall --user 0 com.android.packageinstaller'"
+            fi
+          fi
 
           ui_print "- Brand check passed"
           ui_print "- Original path: $ORIGINAL"
