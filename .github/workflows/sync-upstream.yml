@@ -1,0 +1,72 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    # Daily at 21:17 UTC (~05:17 Beijing time); odd minute avoids runner congestion
+    - cron: '17 21 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Sync from upstream main
+        id: sync
+        run: |
+          set -euo pipefail
+
+          git remote add upstream https://github.com/wxxsfxyzm/InstallerX-Revived.git
+          git fetch upstream main
+
+          OLD_HEAD="$(git rev-parse HEAD)"
+
+          # Take upstream main wholesale, then restore our custom .github
+          # (build workflow etc.) on top of it.
+          git reset --hard upstream/main
+          rm -rf .github
+          git checkout "$OLD_HEAD" -- .github
+
+          # Compare the RESULT tree against our current tree. Comparing
+          # commit SHAs would always differ (our .github commits sit on
+          # top), causing redundant syncs and builds.
+          if git diff --quiet HEAD; then
+            echo "Upstream main unchanged - nothing to sync"
+            git reset --hard "$OLD_HEAD"
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git commit -m "Sync upstream $(git rev-parse --short upstream/main)"
+
+          git push --force-with-lease origin main
+          echo "updated=true" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger build workflow
+        if: steps.sync.outputs.updated == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # GITHUB_TOKEN pushes do not cascade-trigger other workflows,
+          # so dispatch the build explicitly.
+          curl -sf -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/build-packageinstaller.yml/dispatches" \
+            -d '{"ref":"main"}'
+
+          echo "Build workflow dispatched"
