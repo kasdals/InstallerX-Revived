@@ -1,0 +1,64 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    # Daily at 21:17 UTC (~05:17 Beijing time); odd minute avoids runner congestion
+    - cron: '17 21 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Sync from upstream
+        run: |
+          set -euo pipefail
+
+          git remote add upstream https://github.com/wxxsfxyzm/InstallerX-Revived.git
+          git fetch upstream main
+
+          if [ "$(git rev-parse upstream/main)" = "$(git rev-parse HEAD)" ]; then
+            echo "Already up to date with upstream"
+            exit 0
+          fi
+
+          OLD_HEAD="$(git rev-parse HEAD)"
+
+          # Take upstream source wholesale, then restore our custom .github
+          # (build workflow etc.) so the pushed diff never touches workflow
+          # files - GITHUB_TOKEN is not allowed to modify workflows.
+          git reset --hard upstream/main
+          git checkout "$OLD_HEAD" -- .github
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git commit -m "Sync upstream $(git rev-parse --short upstream/main)"
+
+          git push --force-with-lease origin main
+
+      - name: Trigger build workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # GITHUB_TOKEN pushes do not cascade-trigger other workflows,
+          # so dispatch the build explicitly.
+          curl -sf -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/build-packageinstaller.yml/dispatches" \
+            -d '{"ref":"main"}'
+
+          echo "Build workflow dispatched"
